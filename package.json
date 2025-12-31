@@ -1,0 +1,15 @@
+{
+  "name": "pcc-award-report",
+  "version": "1.0.0",
+  "type": "commonjs",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "axios": "^1.13.2",
+    "exceljs": "^4.4.0",
+    "express": "^5.2.1",
+    "xml2js": "^0.6.2"
+  }
+}
