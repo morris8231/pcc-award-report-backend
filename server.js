@@ -11,17 +11,53 @@ const fs = require('fs');
 const path = require('path');
 
 const app = express();
-const PORT = 3000;
+
+// ✅ Render 需要用 process.env.PORT
+const PORT = process.env.PORT || 3000;
+
+// ✅ 允許的前端來源（GitHub Pages + 本機測試）
+const ALLOWED_ORIGINS = new Set([
+  'https://morris8231.github.io',
+  'http://localhost:3000',
+  'http://127.0.0.1:3000',
+  'http://localhost:5500', // VSCode Live Server 常用
+  'http://127.0.0.1:5500'
+]);
 
 app.use(express.json());
 app.use(express.static(__dirname));
+
+// ======================
+// ✅ A) 全域 CORS + OPTIONS（必備）
+// ======================
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+
+  // 有些請求（例如 curl / 直接瀏覽器開 /download）不一定有 Origin
+  if (!origin) {
+    return next();
+  }
+
+  if (ALLOWED_ORIGINS.has(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Vary', 'Origin');
+    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  }
+
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(200);
+  }
+
+  next();
+});
 
 // reports dir
 const reportsDir = path.join(__dirname, 'reports');
 if (!fs.existsSync(reportsDir)) fs.mkdirSync(reportsDir, { recursive: true });
 
 // ======================
-// SSE 進度
+// ✅ SSE 進度
 // ======================
 let clients = [];
 let isRunning = false;
@@ -40,9 +76,14 @@ let progressState = {
   rawRowCount: 0
 };
 
+// ✅ C) 統一廣播（你原本 sendProgress 會留著用，另外加一個更清楚的封裝）
+function broadcastProgress(stateObj) {
+  const payload = `data: ${JSON.stringify(stateObj)}\n\n`;
+  clients.forEach((res) => res.write(payload));
+}
+
 function sendProgress() {
-  const payload = `data: ${JSON.stringify(progressState)}\n\n`;
-  clients.forEach((c) => c.write(payload));
+  broadcastProgress(progressState);
 }
 
 function updateProgress(label, count, message = '') {
@@ -56,13 +97,25 @@ function updateProgress(label, count, message = '') {
   sendProgress();
 }
 
+// ✅ B) /progress SSE：一定要補 SSE headers + CORS（EventSource 才不會被擋）
 app.get('/progress', (req, res) => {
-  res.set({
-    'Content-Type': 'text/event-stream; charset=utf-8',
-    'Cache-Control': 'no-cache',
-    Connection: 'keep-alive'
-  });
+  const origin = req.headers.origin;
+
+  // CORS for SSE
+  if (origin && ALLOWED_ORIGINS.has(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Vary', 'Origin');
+  }
+
+  // SSE required headers
+  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+
   res.flushHeaders?.();
+
+  // 先送一個 ping，讓前端知道「連上了」
+  res.write(`event: ping\ndata: ${JSON.stringify({ ok: true, ts: Date.now() })}\n\n`);
 
   clients.push(res);
   sendProgress();
@@ -105,6 +158,7 @@ app.get('/history', (req, res) => {
   if (!fs.existsSync(historyFile)) return res.json([]);
   try {
     const data = JSON.parse(fs.readFileSync(historyFile, 'utf8'));
+
     // ✅ 依需求：前端不需要 JSON 下載選項，所以 history 回傳也不帶 json 欄位
     const cleaned = Array.isArray(data)
       ? data.map((x) => ({
@@ -123,11 +177,20 @@ app.get('/history', (req, res) => {
 app.get('/download/:file', (req, res) => {
   const filePath = path.join(reportsDir, req.params.file);
   if (!fs.existsSync(filePath)) return res.status(404).send('檔案不存在');
+
+  // 若你用 fetch 下載也會需要 CORS（保險起見補上）
+  const origin = req.headers.origin;
+  if (origin && ALLOWED_ORIGINS.has(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Vary', 'Origin');
+  }
+
   res.download(filePath);
 });
 
+// ✅ D) Render 正確 listen
 app.listen(PORT, () => {
-  console.log(`Server started at http://localhost:${PORT}`);
+  console.log(`Server started on port ${PORT}`);
 });
 
 // ======================
@@ -185,7 +248,7 @@ async function generateJob(startDate, endDate) {
     const tenders = extractTenders(xmlObj);
 
     for (const tender of tenders) {
-      // 主要欄位（你原本的計算方式不變）
+      // 主要欄位（計算方式不變）
       const bidderName = safeGet(tender, ['BIDDER_LIST', 'BIDDER_SUPP_NAME']) || '';
       const awardDate = safeGet(tender, ['AWARD_NOTICE_DATE']) || safeGet(tender, ['AWARD_DATE']) || '';
       const tenderNo = safeGet(tender, ['TENDER_NO']) || '';
@@ -205,7 +268,7 @@ async function generateJob(startDate, endDate) {
       const price = priceText ? Number(priceText) : 0;
       const priceMillion = price ? price / 1_000_000 : 0;
 
-      // 保留 JSON（你雖然前端不下載，但留著備用）
+      // 保留 JSON（前端不下載但留存）
       jsonRecords.push({ sourceFile: fileName, tender });
 
       rawRows.push({
@@ -253,7 +316,7 @@ async function generateJob(startDate, endDate) {
   summaryRows.sort((a, b) => new Date(b.awardNoticeDate) - new Date(a.awardNoticeDate));
 
   // 檔名：頭份_尾份（以檔名 token 排序後取頭尾）
-  const sortedTokens = attemptedTokens.filter(Boolean).sort(); // 字串排序對 YYYYMMDD 有效
+  const sortedTokens = attemptedTokens.filter(Boolean).sort();
   const startToken = sortedTokens[0] || `report_${Date.now()}`;
   const endToken = sortedTokens[sortedTokens.length - 1] || startToken;
   const baseName = `${startToken}_${endToken}`;
