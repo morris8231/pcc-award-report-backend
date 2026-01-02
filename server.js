@@ -121,13 +121,12 @@ app.post("/generate", (req, res) => {
   const { startDate, endDate } = req.body || {};
   if (!startDate || !endDate) return res.status(400).json({ message: "缺少日期" });
 
-  // ✅ 每次開始都 reset
+  // 每次開始都 reset
   progressState = createEmptyProgress();
   broadcastProgress();
 
-  // ✅ 建議：先算出本次應處理多少期，先把 total 設好（避免 0/0）
-  // 你必須在這裡用你自己的規則算出 periods（每月 1 號 / 16 號）
-  // 這裡先留 hook：如果你已經在 generateJob 內算 periods，就把 total 設定搬到 generateJob 一開始做也可以
+  // （可選）先計算期數 periods，再設置 total；也可以在 generateJob 裡先設
+  // const periods = getPeriods(startDate, endDate);
   // setProgressTotal(periods.length);
 
   // 立刻回應前端：開始了
@@ -176,18 +175,24 @@ app.listen(PORT, "0.0.0.0", () => {
 });
 
 // ====== 產生報表邏輯 ======
-// 你把原本的 generateJob 內容貼回來，並且在一開始就：
-/*
 async function generateJob(startDate, endDate, helpers) {
   const { updateProgress, setProgressTotal, markDone } = helpers;
 
   // 1) 先算 periods（每月 1 / 16）=> periods[]
-  // setProgressTotal(periods.length);
+  //    例如：
+  //    const periods = getPeriods(startDate, endDate);
+  //    setProgressTotal(periods.length);
 
-  // 2) 每處理完一份資料就 updateProgress(label, count, message)
-  // 3) 完成後 markDone(true, "完成", { reportFile, summaryRowCount, rawRowCount })
-}
-*/
-async function generateJob(startDate, endDate, helpers) {
-  // ... 保留你之前的程式
+  // 2) 依序處理每個 period：
+  //    - fetch 政府資料
+  //    - parse XML / JSON
+  //    - 加入 ExcelJS workbook
+  //    - updateProgress(label, count)
+
+  // 3) 最後寫入報表檔並更新 history.json
+  //    markDone(true, "完成", {
+  //      reportFile: fileName,
+  //      summaryRowCount: xxx,
+  //      rawRowCount: yyy,
+  //    });
 }
