@@ -192,6 +192,7 @@ async function generateJob(startDate, endDate, helpers) {
   // 3) 最後寫入報表檔並更新 history.json
   //    markDone(true, "完成", {
   //      reportFile: fileName,
+  
   //      summaryRowCount: xxx,
   //      rawRowCount: yyy,
   //    });
