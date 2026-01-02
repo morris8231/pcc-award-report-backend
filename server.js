@@ -1,161 +1,120 @@
-const express = require("express");
-const axios = require("axios");
-const xml2js = require("xml2js");
-const ExcelJS = require("exceljs");
-const fs = require("fs");
-const path = require("path");
+// server.js
+// 政府採購網 OpenData 決標資料：award_YYYYMM01.xml / award_YYYYMM02.xml
+// 改良版：適用於 Render (加入 CORS 與 PORT 設定)
+
+const express = require('express');
+const axios = require('axios');
+const xml2js = require('xml2js');
+const ExcelJS = require('exceljs');
+const fs = require('fs');
+const path = require('path');
+const cors = require('cors'); // 新增 CORS
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+// Render 會自動分配 PORT，若無則用 3000
+constjh PORT = process.env.PORT || 3000;
 
+app.use(cors()); // 允許跨域請求 (Frontend 和 Backend 不同網址時必須)
 app.use(express.json());
+// 雲端版後端不需要 serve static，這行可以保留但不重要
 app.use(express.static(__dirname));
 
-// reports 目錄
-const reportsDir = path.join(__dirname, "reports");
-if (!fs.existsSync(reportsDir)) fs.mkdirSync(reportsDir);
+// reports dir
+// 注意：Render 免費版硬碟是暫時的，重啟後檔案會消失，但執行期間是可以用的
+const reportsDir = path.join(__dirname, 'reports');
+if (!fs.existsSync(reportsDir)) fs.mkdirSync(reportsDir, { recursive: true });
 
-// CORS：允許 GitHub Pages 域名及本地端
-app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", "*"); // 你也可改成 https://morris8231.github.io
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-  if (req.method === "OPTIONS") return res.sendStatus(204);
-  next();
-});
-
-// ====== 進度狀態（單一任務版） ======
-let clients = new Set();
+// ======================
+// SSE 進度
+// ======================
+let clients = [];
 let isRunning = false;
 
-function createEmptyProgress() {
-  return {
-    current: 0,
-    total: 0,
-    percent: 0,
-    labels: [],
-    counts: [],
-    complete: false,
-    error: false,
-    message: "",
-    reportFile: "",
-    summaryRowCount: 0,
-    rawRowCount: 0,
-  };
-}
+let progressState = {
+  current: 0,
+  total: 0,
+  percent: 0,
+  labels: [],
+  counts: [],
+  complete: false,
+  error: false,
+  message: '',
+  reportFile: '',
+  summaryRowCount: 0,
+  rawRowCount: 0
+};
 
-let progressState = createEmptyProgress();
-
-function broadcastProgress() {
+function sendProgress() {
   const payload = `data: ${JSON.stringify(progressState)}\n\n`;
-  for (const res of clients) {
-    try {
-      res.write(payload);
-    } catch {
-      clients.delete(res);
-    }
-  }
+  clients.forEach((c) => c.write(payload));
 }
 
-function setProgressTotal(total) {
-  progressState.total = total;
-  progressState.percent = total ? Math.round((progressState.current / total) * 100) : 0;
-  broadcastProgress();
-}
-
-function updateProgress(label, count, message = "") {
+function updateProgress(label, count, message = '') {
   progressState.current += 1;
   progressState.labels.push(label);
   progressState.counts.push(count);
   progressState.percent = progressState.total
     ? Math.min(100, Math.round((progressState.current / progressState.total) * 100))
-    : 0;
+    : 100;
   if (message) progressState.message = message;
-  broadcastProgress();
+  sendProgress();
 }
 
-function markDone(ok = true, message = "", extra = {}) {
-  progressState.complete = true;
-  progressState.error = !ok;
-  if (message) progressState.message = message;
-  Object.assign(progressState, extra);
-  broadcastProgress();
-}
-
-// ====== SSE ======
-app.get("/progress", (req, res) => {
-  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
-  res.setHeader("Cache-Control", "no-cache, no-transform");
-  res.setHeader("Connection", "keep-alive");
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  // 某些 proxy 會 buffer SSE；加這行可提升穩定性（若環境支援）
-  res.setHeader("X-Accel-Buffering", "no");
-
+app.get('/progress', (req, res) => {
+  res.set({
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache',
+    Connection: 'keep-alive'
+  });
   res.flushHeaders?.();
 
-  clients.add(res);
+  clients.push(res);
+  sendProgress();
 
-  // 先送一次快照
-  res.write(`data: ${JSON.stringify(progressState)}\n\n`);
-
-  // keep-alive ping，避免中間層斷線
-  const ping = setInterval(() => {
-    try {
-      res.write(`: ping\n\n`);
-    } catch {
-      clearInterval(ping);
-      clients.delete(res);
-    }
-  }, 15000);
-
-  req.on("close", () => {
-    clearInterval(ping);
-    clients.delete(res);
+  req.on('close', () => {
+    clients = clients.filter((c) => c !== res);
   });
 });
 
-// ====== generate ======
-app.post("/generate", (req, res) => {
-  if (isRunning) return res.status(409).json({ message: "已有報表正在產生中，請稍候。" });
+// ======================
+// API
+// ======================
+app.post('/generate', (req, res) => {
+  if (isRunning) return res.status(409).json({ message: '目前已有報表正在產生中，請稍後再試。' });
 
   const { startDate, endDate } = req.body || {};
-  if (!startDate || !endDate) return res.status(400).json({ message: "缺少日期" });
+  if (!startDate || !endDate) return res.status(400).json({ message: '缺少 startDate / endDate' });
 
-  // 每次開始都 reset
-  progressState = createEmptyProgress();
-  broadcastProgress();
-
-  // （可選）先計算期數 periods，再設置 total；也可以在 generateJob 裡先設
-  // const periods = getPeriods(startDate, endDate);
-  // setProgressTotal(periods.length);
-
-  // 立刻回應前端：開始了
+  // 立刻回應，讓前端開始聽 SSE
   res.json({ started: true });
 
   (async () => {
     isRunning = true;
     try {
-      await generateJob(startDate, endDate, { updateProgress, setProgressTotal, markDone });
+      await generateJob(startDate, endDate);
     } catch (err) {
       console.error(err);
-      markDone(false, err?.message || "產生失敗");
+      progressState.complete = true;
+      progressState.error = true;
+      progressState.message = err?.message || '產生失敗';
+      sendProgress();
     } finally {
       isRunning = false;
     }
   })();
 });
 
-app.get("/history", (req, res) => {
-  const historyFile = path.join(reportsDir, "history.json");
+app.get('/history', (req, res) => {
+  const historyFile = path.join(reportsDir, 'history.json');
   if (!fs.existsSync(historyFile)) return res.json([]);
   try {
-    const data = JSON.parse(fs.readFileSync(historyFile, "utf8"));
+    const data = JSON.parse(fs.readFileSync(historyFile, 'utf8'));
     const cleaned = Array.isArray(data)
       ? data.map((x) => ({
           file: x.file,
           summaryCount: x.summaryCount,
           rawCount: x.rawCount,
-          created: x.created,
+          created: x.created
         }))
       : [];
     res.json(cleaned);
@@ -164,36 +123,298 @@ app.get("/history", (req, res) => {
   }
 });
 
-app.get("/download/:file", (req, res) => {
+app.get('/download/:file', (req, res) => {
   const filePath = path.join(reportsDir, req.params.file);
-  if (!fs.existsSync(filePath)) return res.status(404).send("檔案不存在");
+  if (!fs.existsSync(filePath)) return res.status(404).send('檔案不存在');
   res.download(filePath);
 });
 
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Server started on port ${PORT}`);
+// 這裡要用 listen PORT (變數)
+app.listen(PORT, () => {
+  console.log(`Server started at port ${PORT}`);
 });
 
-// ====== 產生報表邏輯 ======
-async function generateJob(startDate, endDate, helpers) {
-  const { updateProgress, setProgressTotal, markDone } = helpers;
+// ======================
+// 核心流程 (保持不變)
+// ======================
+async function generateJob(startDate, endDate) {
+  const files = buildFileList(startDate, endDate);
 
-  // 1) 先算 periods（每月 1 / 16）=> periods[]
-  //    例如：
-  //    const periods = getPeriods(startDate, endDate);
-  //    setProgressTotal(periods.length);
+  progressState = {
+    current: 0,
+    total: files.length,
+    percent: files.length ? 0 : 100,
+    labels: [],
+    counts: [],
+    complete: false,
+    error: false,
+    message: '開始處理…',
+    reportFile: '',
+    summaryRowCount: 0,
+    rawRowCount: 0
+  };
+  sendProgress();
 
-  // 2) 依序處理每個 period：
-  //    - fetch 政府資料
-  //    - parse XML / JSON
-  //    - 加入 ExcelJS workbook
-  //    - updateProgress(label, count)
+  const jsonRecords = [];
+  const rawRows = [];
+  const bidderMap = Object.create(null);
+  const attemptedTokens = []; 
 
-  // 3) 最後寫入報表檔並更新 history.json
-  //    markDone(true, "完成", {
-  //      reportFile: fileName,
-  
-  //      summaryRowCount: xxx,
-  //      rawRowCount: yyy,
-  //    });
+  for (const { fileName } of files) {
+    const token = fileNameToToken(fileName); 
+    attemptedTokens.push(token);
+
+    let xmlText = '';
+    try {
+      xmlText = await downloadAwardXml(fileName); 
+    } catch (e) {
+      updateProgress(fileName, 0, `下載失敗：${fileName}`);
+      continue;
+    }
+
+    let xmlObj;
+    try {
+      xmlObj = await xml2js.parseStringPromise(xmlText, {
+        explicitArray: false,
+        trim: true,
+        mergeAttrs: true
+      });
+    } catch {
+      updateProgress(fileName, 0, `解析失敗：${fileName}`);
+      continue;
+    }
+
+    const tenders = extractTenders(xmlObj);
+
+    for (const tender of tenders) {
+      const bidderName = safeGet(tender, ['BIDDER_LIST', 'BIDDER_SUPP_NAME']) || '';
+      const awardDate = safeGet(tender, ['AWARD_NOTICE_DATE']) || safeGet(tender, ['AWARD_DATE']) || '';
+      const tenderNo = safeGet(tender, ['TENDER_NO']) || '';
+      const tenderName = safeGet(tender, ['TENDER_NAME']) || '';
+      const orgName =
+        safeGet(tender, ['ORG_NAME']) ||
+        safeGet(tender, ['PROCURING_ENTITY_NAME']) ||
+        safeGet(tender, ['PROCURING_ENTITY']) ||
+        '';
+
+      const priceText = String(
+        safeGet(tender, ['TENDER_AWARD_PRICE']) ||
+          safeGet(tender, ['AWARD_PRICE']) ||
+          ''
+      ).replace(/,/g, '');
+
+      const price = priceText ? Number(priceText) : 0;
+      const priceMillion = price ? price / 1_000_000 : 0;
+
+      jsonRecords.push({ sourceFile: fileName, tender });
+
+      rawRows.push({
+        sourceFile: fileName,
+        tenderNo,
+        tenderName,
+        orgName,
+        bidderName,
+        awardDate,
+        awardPrice: price,
+        awardPriceMillion: Number.isFinite(priceMillion) ? Number(priceMillion.toFixed(6)) : 0
+      });
+
+      if (bidderName) {
+        if (!bidderMap[bidderName]) {
+          bidderMap[bidderName] = { count: 0, sumMillion: 0, latestDate: '', latestPriceMillion: 0 };
+        }
+
+        bidderMap[bidderName].count += 1;
+        bidderMap[bidderName].sumMillion += priceMillion;
+
+        if (
+          awardDate &&
+          (!bidderMap[bidderName].latestDate ||
+            new Date(awardDate) > new Date(bidderMap[bidderName].latestDate))
+        ) {
+          bidderMap[bidderName].latestDate = awardDate;
+          bidderMap[bidderName].latestPriceMillion = priceMillion;
+        }
+      }
+    }
+
+    updateProgress(fileName, tenders.length, '');
+  }
+
+  const summaryRows = Object.entries(bidderMap).map(([name, info]) => ({
+    companyName: name,
+    awardNoticeDate: info.latestDate || '',
+    latestPriceMillion: Number.isFinite(info.latestPriceMillion) ? Number(info.latestPriceMillion.toFixed(1)) : 0,
+    cumulativeCount: info.count,
+    cumulativeSumMillion: Number.isFinite(info.sumMillion) ? Number(info.sumMillion.toFixed(1)) : 0
+  }));
+  summaryRows.sort((a, b) => new Date(b.awardNoticeDate) - new Date(a.awardNoticeDate));
+
+  const sortedTokens = attemptedTokens.filter(Boolean).sort(); 
+  const startToken = sortedTokens[0] || `report_${Date.now()}`;
+  const endToken = sortedTokens[sortedTokens.length - 1] || startToken;
+  const baseName = `${startToken}_${endToken}`;
+
+  const jsonFileName = `${baseName}.json`;
+  fs.writeFileSync(path.join(reportsDir, jsonFileName), JSON.stringify(jsonRecords, null, 2), 'utf8');
+
+  const workbook = new ExcelJS.Workbook();
+
+  const sheet1 = workbook.addWorksheet('Summary');
+  sheet1.columns = [
+    { header: '公司名稱', key: 'companyName', width: 40 },
+    { header: '決標公告日期', key: 'awardNoticeDate', width: 18 },
+    { header: '最新得標價格(百萬)', key: 'latestPriceMillion', width: 20 },
+    { header: '累積得標次數', key: 'cumulativeCount', width: 18 },
+    { header: '累積得標金額', key: 'cumulativeSumMillion', width: 18 }
+  ];
+  summaryRows.forEach((r) => sheet1.addRow(r));
+
+  const sheet2 = workbook.addWorksheet('RawData');
+  sheet2.columns = [
+    { header: 'sourceFile', key: 'sourceFile', width: 20 },
+    { header: 'tenderNo', key: 'tenderNo', width: 22 },
+    { header: 'tenderName', key: 'tenderName', width: 50 },
+    { header: 'orgName', key: 'orgName', width: 30 },
+    { header: 'bidderName', key: 'bidderName', width: 30 },
+    { header: 'awardDate', key: 'awardDate', width: 18 },
+    { header: 'awardPrice', key: 'awardPrice', width: 18 },
+    { header: 'awardPriceMillion', key: 'awardPriceMillion', width: 18 }
+  ];
+  rawRows.forEach((r) => sheet2.addRow(r));
+
+  const xlsxFileName = `${baseName}.xlsx`;
+  await workbook.xlsx.writeFile(path.join(reportsDir, xlsxFileName));
+
+  const historyFile = path.join(reportsDir, 'history.json');
+  let history = [];
+  if (fs.existsSync(historyFile)) {
+    try {
+      history = JSON.parse(fs.readFileSync(historyFile, 'utf8'));
+      if (!Array.isArray(history)) history = [];
+    } catch {
+      history = [];
+    }
+  }
+  history.unshift({
+    file: xlsxFileName,
+    json: jsonFileName,
+    summaryCount: summaryRows.length,
+    rawCount: rawRows.length,
+    created: new Date().toISOString()
+  });
+  fs.writeFileSync(historyFile, JSON.stringify(history, null, 2), 'utf8');
+
+  progressState.complete = true;
+  progressState.error = false;
+  progressState.percent = 100;
+  progressState.reportFile = xlsxFileName;
+  progressState.summaryRowCount = summaryRows.length;
+  progressState.rawRowCount = rawRows.length;
+  progressState.message = `完成：${xlsxFileName}（Summary ${summaryRows.length} / Raw ${rawRows.length}）`;
+  sendProgress();
+}
+
+function buildFileList(start, end) {
+  const s = new Date(start);
+  const e = new Date(end);
+  if (Number.isNaN(s.getTime()) || Number.isNaN(e.getTime()) || s > e) return [];
+
+  const cur = new Date(s.getFullYear(), s.getMonth(), 1);
+  const set = new Map();
+
+  while (cur <= e) {
+    const y = cur.getFullYear();
+    const m = String(cur.getMonth() + 1).padStart(2, '0');
+
+    const firstHalfStart = new Date(y, cur.getMonth(), 1);
+    const firstHalfEnd = new Date(y, cur.getMonth(), 15);
+    const secondHalfStart = new Date(y, cur.getMonth(), 16);
+    const secondHalfEnd = new Date(y, cur.getMonth() + 1, 0);
+
+    if (rangesOverlap(s, e, firstHalfStart, firstHalfEnd)) {
+      set.set(`award_${y}${m}01.xml`, { fileName: `award_${y}${m}01.xml` });
+    }
+    if (rangesOverlap(s, e, secondHalfStart, secondHalfEnd)) {
+      set.set(`award_${y}${m}02.xml`, { fileName: `award_${y}${m}02.xml` });
+    }
+
+    cur.setMonth(cur.getMonth() + 1);
+  }
+
+  return Array.from(set.values());
+}
+
+function rangesOverlap(aStart, aEnd, bStart, bEnd) {
+  return aStart <= bEnd && bStart <= aEnd;
+}
+
+function fileNameToToken(fileName) {
+  return String(fileName || '')
+    .replace(/^award_/, '')
+    .replace(/\.xml$/i, '');
+}
+
+async function downloadAwardXml(fileName) {
+  const hosts = ['https://planpe.pcc.gov.tw', 'https://web.pcc.gov.tw'];
+  let lastErr = null;
+
+  for (const host of hosts) {
+    const url = `${host}/tps/tp/OpenData/downloadFile?fileName=${encodeURIComponent(fileName)}`;
+    try {
+      const resp = await axios.get(url, {
+        responseType: 'arraybuffer',
+        timeout: 45000,
+        maxRedirects: 5,
+        validateStatus: (s) => s >= 200 && s < 400,
+        headers: {
+          Referer: `${host}/tps/tp/OpenData/showList`,
+          'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+          Accept: 'application/xml,text/xml,*/*',
+          'Accept-Language': 'zh-TW,zh;q=0.9,en;q=0.7',
+          'Cache-Control': 'no-cache',
+          Pragma: 'no-cache'
+        }
+      });
+
+      const text = Buffer.from(resp.data).toString('utf8').trim();
+      if (text.startsWith('<!DOCTYPE html') || text.includes('<html')) {
+        throw new Error(`Got HTML instead of XML from ${host}`);
+      }
+      return text;
+    } catch (e) {
+      lastErr = e;
+      continue;
+    }
+  }
+  const status = lastErr?.response?.status;
+  throw new Error(`下載失敗：${fileName}（planpe/web 都失敗，status=${status ?? 'n/a'}）`);
+}
+
+function extractTenders(obj) {
+  const results = [];
+  (function walk(node) {
+    if (!node) return;
+    if (Array.isArray(node)) return node.forEach(walk);
+    if (typeof node !== 'object') return;
+    for (const [k, v] of Object.entries(node)) {
+      if (k === 'TENDER') {
+        if (Array.isArray(v)) results.push(...v);
+        else if (v) results.push(v);
+      } else {
+        walk(v);
+      }
+    }
+  })(obj);
+  return results.filter(Boolean);
+}
+
+function safeGet(obj, pathArr) {
+  let cur = obj;
+  for (const k of pathArr) {
+    if (!cur || typeof cur !== 'object') return '';
+    cur = cur[k];
+  }
+  return cur ?? '';
 }
